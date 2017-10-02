@@ -106,6 +106,15 @@ lws_free_wsi(struct lws *wsi)
 	wsi->peer = NULL;
 #endif
 
+#if defined(LWS_WITH_HTTP2)
+	if (wsi->upgraded_to_http2 || wsi->http2_substream) {
+		lws_hpack_destroy_dynamic_header(wsi);
+
+		if (wsi->u.h2.h2n)
+			lws_free_set_NULL(wsi->u.h2.h2n);
+	}
+#endif
+
 	lws_pt_unlock(pt);
 
 	/* since we will destroy the wsi, make absolutely sure now */
@@ -337,6 +346,71 @@ lws_close_free_wsi(struct lws *wsi, enum lws_close_status reason)
 		wsi->child_list = NULL;
 	}
 
+#if defined(LWS_WITH_HTTP2)
+
+	if (wsi->u.h2.parent_wsi) {
+		lwsl_info(" wsi: %p, his parent %p: siblings:\n", wsi, wsi->u.h2.parent_wsi->u.h2.child_list);
+		lws_start_foreach_llp(struct lws **, w, wsi->u.h2.parent_wsi->u.h2.child_list) {
+			lwsl_info("   \\---- child %p\n", *w);
+		} lws_end_foreach_llp(w, u.h2.sibling_list);
+	}
+
+	if (wsi->upgraded_to_http2 || wsi->http2_substream) {
+		lwsl_info("closing %p: parent %p\n", wsi, wsi->u.h2.parent_wsi);
+
+		if (wsi->u.h2.child_list) {
+			lwsl_info(" parent %p: closing children: list:\n", wsi);
+			lws_start_foreach_llp(struct lws **, w, wsi->u.h2.child_list) {
+				lwsl_info("   \\---- child %p\n", *w);
+			} lws_end_foreach_llp(w, u.h2.sibling_list);
+			/* trigger closing of all of our http2 children first */
+			lws_start_foreach_llp(struct lws **, w, wsi->u.h2.child_list) {
+				lwsl_info("   closing child %p\n", *w);
+				/* disconnect from siblings */
+				wsi2 = (*w)->u.h2.sibling_list;
+				(*w)->u.h2.sibling_list = NULL;
+				(*w)->socket_is_permanently_unusable = 1;
+				lws_close_free_wsi(*w, reason);
+				*w = wsi2;
+				continue;
+			} lws_end_foreach_llp(w, u.h2.sibling_list);
+		}
+	}
+
+	if (wsi->upgraded_to_http2) {
+		/* remove pps */
+		struct lws_h2_protocol_send *w = wsi->u.h2.h2n->pps, *w1;
+		while (w) {
+			w1 = wsi->u.h2.h2n->pps->next;
+			free(w);
+			w = w1;
+		}
+		wsi->u.h2.h2n->pps = NULL;
+	}
+
+	if (wsi->http2_substream && wsi->u.h2.parent_wsi) {
+		lwsl_info("  %p: disentangling from siblings\n", wsi);
+		lws_start_foreach_llp(struct lws **, w,
+				wsi->u.h2.parent_wsi->u.h2.child_list) {
+			/* disconnect from siblings */
+			if (*w == wsi) {
+				wsi2 = (*w)->u.h2.sibling_list;
+				(*w)->u.h2.sibling_list = NULL;
+				*w = wsi2;
+				lwsl_info("  %p disentangled from sibling %p\n", wsi, wsi2);
+				break;
+			}
+		} lws_end_foreach_llp(w, u.h2.sibling_list);
+		wsi->u.h2.parent_wsi->u.h2.child_count--;
+		wsi->u.h2.parent_wsi = NULL;
+	}
+
+	if (wsi->upgraded_to_http2) {
+		if (wsi->u.h2.h2n && wsi->u.h2.h2n->rx_scratch)
+			lws_free_set_NULL(wsi->u.h2.h2n->rx_scratch);
+	}
+#endif
+
 	if (wsi->mode == LWSCM_RAW_FILEDESC) {
 			lws_remove_child_from_any_parent(wsi);
 			remove_wsi_socket_from_fds(wsi);
@@ -536,6 +610,7 @@ lws_close_free_wsi(struct lws *wsi, enum lws_close_status reason)
 just_kill_connection:
 
 	lws_remove_child_from_any_parent(wsi);
+	n = 0;
 
 #if LWS_POSIX
 	/*
@@ -552,8 +627,6 @@ just_kill_connection:
 	    reason != LWS_CLOSE_STATUS_NOSTATUS_CONTEXT_DESTROY &&
 	    !wsi->socket_is_permanently_unusable) {
 #ifdef LWS_OPENSSL_SUPPORT
-		int shutdown_error;
-
 		if (lws_is_ssl(wsi) && wsi->ssl) {
 			n = SSL_shutdown(wsi->ssl);
 			/*
@@ -568,30 +641,28 @@ just_kill_connection:
 				n = shutdown(wsi->desc.sockfd, SHUT_WR);
 				break;
 			default:
-				shutdown_error = SSL_get_error(wsi->ssl, n);
-				lwsl_debug("SSL_shutdown %d, get_error: %d\n",
-					   n, shutdown_error);
-				switch (shutdown_error) {
-				case SSL_ERROR_WANT_READ:
-					lws_change_pollfd(wsi, LWS_POLLOUT, LWS_POLLIN);
+				if (SSL_want_read(wsi->ssl)) {
+					lws_change_pollfd(wsi, 0, LWS_POLLIN);
 					n = 0;
-					break;
-				case SSL_ERROR_WANT_WRITE:
-					lws_change_pollfd(wsi, LWS_POLLOUT, LWS_POLLOUT);
-					n = 0;
-					break;
-				default: /* real error, close */
-					n = shutdown(wsi->desc.sockfd, SHUT_WR);
 					break;
 				}
+				if (SSL_want_write(wsi->ssl)) {
+					lws_change_pollfd(wsi, 0, LWS_POLLOUT);
+					n = 0;
+					break;
+				}
+				n = shutdown(wsi->desc.sockfd, SHUT_WR);
+				break;
 			}
 		} else
 #endif
 		{
-			lwsl_info("%s: shuttdown conn: %p (sock %d, state %d)\n",
+			lwsl_info("%s: shutdown conn: %p (sock %d, state %d)\n",
 				  __func__, wsi, (int)(long)wsi->desc.sockfd,
 				  wsi->state);
-			n = shutdown(wsi->desc.sockfd, SHUT_WR);
+			if (!wsi->socket_is_permanently_unusable &&
+			    lws_sockfd_valid(wsi->desc.sockfd))
+				n = shutdown(wsi->desc.sockfd, SHUT_WR);
 		}
 		if (n)
 			lwsl_debug("closing: shutdown (state %d) ret %d\n",
@@ -603,7 +674,9 @@ just_kill_connection:
 		 */
 #if !defined(_WIN32_WCE) && !defined(LWS_WITH_ESP32)
 		/* libuv: no event available to guarantee completion */
-		if (!LWS_LIBUV_ENABLED(context)) {
+		if (!wsi->socket_is_permanently_unusable &&
+		    lws_sockfd_valid(wsi->desc.sockfd) &&
+		    !LWS_LIBUV_ENABLED(context)) {
 			lws_change_pollfd(wsi, LWS_POLLOUT, LWS_POLLIN);
 			wsi->state = LWSS_SHUTDOWN;
 			lws_set_timeout(wsi, PENDING_TIMEOUT_SHUTDOWN_FLUSH,
@@ -765,7 +838,7 @@ lws_close_free_wsi_final(struct lws *wsi)
 {
 	int n;
 
-	if (!lws_ssl_close(wsi) && lws_socket_is_valid(wsi->desc.sockfd)) {
+	if (lws_socket_is_valid(wsi->desc.sockfd) && !lws_ssl_close(wsi)) {
 #if LWS_POSIX
 		n = compatible_close(wsi->desc.sockfd);
 		if (n)
@@ -929,6 +1002,11 @@ lws_get_peer_simple(struct lws *wsi, char *name, int namelen)
 	struct sockaddr_in sin4;
 	int af = AF_INET;
 	void *p, *q;
+
+#if defined(LWS_WITH_HTTP2)
+	if (wsi->http2_substream)
+		wsi = wsi->u.h2.parent_wsi;
+#endif
 
 	if (wsi->parent_carries_io)
 		wsi = wsi->parent;
@@ -1671,18 +1749,6 @@ lws_partial_buffered(struct lws *wsi)
 	return !!wsi->trunc_len;
 }
 
-void lws_set_protocol_write_pending(struct lws *wsi,
-				    enum lws_pending_protocol_send pend)
-{
-	lwsl_info("setting pps %d\n", pend);
-
-	if (wsi->pps)
-		lwsl_err("pps overwrite\n");
-	wsi->pps = pend;
-	lws_rx_flow_control(wsi, 0);
-	lws_callback_on_writable(wsi);
-}
-
 LWS_VISIBLE size_t
 lws_get_peer_write_allowance(struct lws *wsi)
 {
@@ -1690,11 +1756,8 @@ lws_get_peer_write_allowance(struct lws *wsi)
 	/* only if we are using HTTP2 on this connection */
 	if (wsi->mode != LWSCM_HTTP2_SERVING)
 		return -1;
-	/* user is only interested in how much he can send, or that he can't  */
-	if (wsi->u.http2.tx_credit <= 0)
-		return 0;
 
-	return wsi->u.http2.tx_credit;
+	return lws_h2_tx_cr_get(wsi);
 #else
 	(void)wsi;
 	return -1;
