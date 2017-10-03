@@ -246,7 +246,7 @@ lws_pps_schedule(struct lws *wsi, struct lws_h2_protocol_send *pps)
 static struct lws_h2_protocol_send *
 lws_h2_new_pps(enum lws_h2_protocol_send_type type)
 {
-	struct lws_h2_protocol_send *pps = lws_malloc(sizeof(*pps));
+	struct lws_h2_protocol_send *pps = lws_malloc(sizeof(*pps), "pps");
 
 	if (pps)
 		pps->type = type;
@@ -849,9 +849,10 @@ lws_h2_parse_frame_header(struct lws *wsi)
 			return 1;
 		}
 
-		if (!h2n->swsi)
+		if (!h2n->swsi) {
 			h2n->swsi = lws_wsi_server_new(wsi->vhost, wsi, h2n->sid);
-
+			lwsl_notice("created wsi %p for sid %d\n", h2n->swsi, h2n->sid);
+		}
 		if (!h2n->swsi) {
 			lws_h2_goaway(wsi, H2_ERR_PROTOCOL_ERROR, "OOM");
 			return 1;

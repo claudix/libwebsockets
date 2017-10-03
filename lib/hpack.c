@@ -413,7 +413,7 @@ lws_dynamic_token_insert(struct lws *wsi, int lws_hdr_index, char *arg, int len)
 	dyn->entries[new_index].value_len = 0;
 
 	if (lws_hdr_index != LWS_HPACK_IGNORE_ENTRY) {
-		dyn->entries[new_index].value = lws_malloc(len + 1);
+		dyn->entries[new_index].value = lws_malloc(len + 1, "hpack dyn");
 		if (!dyn->entries[new_index].value)
 			return 1;
 
@@ -462,7 +462,7 @@ lws_hpack_dynamic_size(struct lws *wsi, int size)
 	if (dyn->num_entries < min)
 		min = dyn->num_entries;
 
-	dte = lws_zalloc(sizeof(*dte) * size);
+	dte = lws_zalloc(sizeof(*dte) * size, "dynamic table entries");
 	if (!dte)
 		goto bail;
 

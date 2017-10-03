@@ -131,7 +131,7 @@ int lws_h2_configure_if_upgraded(struct lws *wsi)
 	/* http2 union member has http union struct at start */
 	wsi->u.http.ah = ah;
 
-	wsi->u.h2.h2n = lws_zalloc(sizeof(*wsi->u.h2.h2n));
+	wsi->u.h2.h2n = lws_zalloc(sizeof(*wsi->u.h2.h2n), "h2n");
 	if (!wsi->u.h2.h2n)
 		return 1;
 

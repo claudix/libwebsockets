@@ -73,7 +73,7 @@ lws_handle_POLLOUT_event(struct lws *wsi, struct lws_pollfd *pollfd)
 	int write_type = LWS_WRITE_PONG;
 	struct lws_tokens eff_buf;
 #ifdef LWS_WITH_HTTP2
-	struct lws *wsi2;
+	struct lws *wsi2, *wsi2a;
 #endif
 	int ret, m, n;
 
@@ -399,6 +399,7 @@ user_service_go_again:
 	if (!wsi2)
 		goto bail_ok;
 	do {
+		wsi2a = wsi2->u.h2.sibling_list;
 		if (wsi2->u.h2.requested_POLLOUT) {
 			wsi2->u.h2.requested_POLLOUT = 0;
 
@@ -434,7 +435,7 @@ user_service_go_again:
 			}
 		}
 next_child:
-		wsi2 = wsi2->u.h2.sibling_list;
+		wsi2 = wsi2a;
 	} while (wsi2 && !lws_send_pipe_choked(wsi));
 
 	lwsl_info("%s: completed\n", __func__);
@@ -539,7 +540,7 @@ int lws_rxflow_cache(struct lws *wsi, unsigned char *buf, int n, int len)
 
 	/* a new rxflow, buffer it and warn caller */
 	lwsl_info("new rxflow input buffer len %d\n", len - n);
-	wsi->rxflow_buffer = lws_malloc(len - n);
+	wsi->rxflow_buffer = lws_malloc(len - n, "rxflow buf");
 
 	if (!wsi->rxflow_buffer)
 		return -1;
@@ -1301,7 +1302,7 @@ read:
 #if defined(LWS_WITH_HTTP2)
 				if (wsi->upgraded_to_http2) {
 					if (!wsi->u.h2.h2n->rx_scratch) {
-						wsi->u.h2.h2n->rx_scratch = lws_malloc(514);
+						wsi->u.h2.h2n->rx_scratch = lws_malloc(514, "h2 rx scratch");
 						if (!wsi->u.h2.h2n->rx_scratch)
 							goto close_and_handled;
 					}
